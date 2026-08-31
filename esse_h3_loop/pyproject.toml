@@ -1,0 +1,10 @@
+[project]
+name = "esse_h3_loop"
+description = "Perfect AV loops for MiniMax H3: latent-handoff loop bridging and Mobius latent rotation."
+version = "0.1.0"
+license = { text = "MIT" }
+dependencies = []
+
+[tool.comfy]
+DisplayName = "Esse H3 Loop"
+PublisherId = "esse"
