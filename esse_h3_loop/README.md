@@ -32,16 +32,28 @@ Splice A + middle and it loops back to A's frame 0.
 
 Pinning uses the mechanisms ComfyUI's H3 integration ships natively:
 
-- `conditioning_rows` (default): never-denoised keyframe cond rows at
-  explicit frame indices — the same mechanism the H3 Motion Context
-  chaining packs use in production for seamless clip joins. Requires
-  ComfyUI ≥ 0.34 (earlier layouts reject mid-clip anchors; the node
-  checks and refuses with a clear message).
-- `latent_mask`: the pinned content is written into the bridge latent
-  under a zero noise mask; H3 relabels preserved rows at the cond
+- `latent_mask` (default): the pinned content is written into the bridge
+  latent under a zero noise mask; H3 relabels preserved rows at the cond
   timestep and injects them clean every step, so the pinned spans come
-  back bit-identical and the splice cuts are exact. Leaner sequence,
-  less field mileage — try both.
+  back latent-identical to A and the splice can cut *inside* them
+  (`seam_inset_frames`) — each join then sits between two frames decoded
+  from the same latent content, making the wrap exact by construction.
+- `conditioning_rows`: never-denoised keyframe cond rows at explicit
+  frame indices — the H3 Motion Context chaining mechanism. Requires
+  ComfyUI ≥ 0.34 (earlier layouts reject mid-clip anchors; the node
+  checks and refuses with a clear message). **Field result:** the head
+  pin (continuation) joins seamlessly, but the tail rows are *arrived
+  at* softly — the middle lands near A's opening (same scene, slightly
+  different framing), the same softness native fl2va shows on its
+  last-frame anchor. Fine for chains; for loops prefer `latent_mask`.
+
+The splice's `seam_inset_frames` (default 5) is what turns "pinned" into
+"seamless": it moves both cuts inside the pinned spans, so the wrap cut
+falls between a real A frame and its pinned copy, and any residual
+model softness stays at the mask edge — inside the clip, where the
+sampler already smoothed it during generation. The splice report prints
+measured seam deltas against the loop's own frame-to-frame baseline
+(near 1x = invisible), so you can judge a run without scrubbing.
 
 Nodes: **H3 Loop Bridge** → sample → **H3 Loop Splice**.
 Workflow: `example_workflows/h3_perfect_loop_bridge.json` — one queue

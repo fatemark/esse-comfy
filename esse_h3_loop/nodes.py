@@ -69,48 +69,58 @@ _CATEGORY = "MiniMax H3/Loop"
 # environment check
 # ---------------------------------------------------------------------------
 
-_h3_checked = None  # None = not yet, True = ok, str = failure message
+_h3_state = None  # None = unchecked, dict = capabilities, str = hard failure
 
 
-def _ensure_h3_ready():
-    """Prove this ComfyUI has the H3 integration these nodes are built on.
+def _h3_capabilities():
+    """Prove this ComfyUI has the H3 integration these nodes are built on,
+    and report which generation of it.
 
-    Two things are load-bearing and neither is guaranteed by a version
-    number: the 1-4-4-4-4 latent frame cycle (all trim/phase arithmetic
-    below), and a PackedLayout that takes keyframe anchors at arbitrary
-    indices (ComfyUI >= 0.34; the first H3 layout rejected anything but
-    the first and last frame, detectable from its extra frame_count
-    parameter). Checked once, on first use, so an installed-but-unused
-    pack costs nothing at startup.
+    Hard requirements for every node here: comfy.ldm.minimax.model exists
+    and the 1-4-4-4-4 latent frame cycle holds (all trim/phase arithmetic
+    is built on it). Soft capability: `arbitrary_anchors` - whether
+    PackedLayout takes keyframe anchors at arbitrary indices. The first
+    H3 integration (still shipping in e.g. v0.30.x) raises "only
+    first/last keyframe anchors are supported" and has no audio keyframe
+    rows at all, detectable from its extra frame_count parameter; later
+    ComfyUI lifted both. Only the bridge's conditioning_rows mode needs
+    the lifted layout - latent_mask pinning and the Mobius rotation work
+    on both generations. Checked once, on first use, so an
+    installed-but-unused pack costs nothing at startup.
     """
-    global _h3_checked
-    if _h3_checked is True:
-        return
-    if isinstance(_h3_checked, str):
-        raise RuntimeError(_h3_checked)
+    global _h3_state
+    if isinstance(_h3_state, dict):
+        return _h3_state
+    if isinstance(_h3_state, str):
+        raise RuntimeError(_h3_state)
     try:
         import comfy.ldm.minimax.model as mm
     except ImportError as exc:
-        _h3_checked = ("esse_h3_loop: this ComfyUI has no MiniMax H3 support "
-                       "(comfy.ldm.minimax.model is missing). Update ComfyUI.")
-        raise RuntimeError(_h3_checked) from exc
+        _h3_state = ("esse_h3_loop: this ComfyUI has no MiniMax H3 support "
+                     "(comfy.ldm.minimax.model is missing). Update ComfyUI.")
+        raise RuntimeError(_h3_state) from exc
     if tuple(getattr(mm, "FRAME_PER_TOKEN", ())) != (1, 4, 4, 4, 4):
-        _h3_checked = ("esse_h3_loop: ComfyUI's H3 FRAME_PER_TOKEN is %r, this "
-                       "pack assumes (1, 4, 4, 4, 4). The latent grid moved; "
-                       "refusing rather than splicing at wrong instants."
-                       % (getattr(mm, "FRAME_PER_TOKEN", None),))
-        raise RuntimeError(_h3_checked)
+        _h3_state = ("esse_h3_loop: ComfyUI's H3 FRAME_PER_TOKEN is %r, this "
+                     "pack assumes (1, 4, 4, 4, 4). The latent grid moved; "
+                     "refusing rather than splicing at wrong instants."
+                     % (getattr(mm, "FRAME_PER_TOKEN", None),))
+        raise RuntimeError(_h3_state)
     import inspect
     try:
         params = inspect.signature(mm.PackedLayout.__init__).parameters
     except (TypeError, ValueError):
         params = {}
-    if "frame_count" in params:
-        _h3_checked = ("esse_h3_loop: this ComfyUI still has the first H3 "
-                       "layout, which rejects keyframe anchors other than the "
-                       "first and last frame. Update ComfyUI (>= 0.34).")
-        raise RuntimeError(_h3_checked)
-    _h3_checked = True
+    _h3_state = {"arbitrary_anchors": "frame_count" not in params}
+    if not _h3_state["arbitrary_anchors"]:
+        _LOG.info("esse_h3_loop: this ComfyUI has the first-generation H3 "
+                  "layout (first/last anchors only). latent_mask pinning "
+                  "and the Mobius route work; conditioning_rows needs a "
+                  "ComfyUI update.")
+    return _h3_state
+
+
+def _ensure_h3_ready():
+    _h3_capabilities()
 
 
 # ---------------------------------------------------------------------------
@@ -282,18 +292,23 @@ class EsseH3LoopBridge:
                                "picture. 0 follows tail_frames; clamped to "
                                "tail_frames so it cannot reach back over the "
                                "generated middle."}),
-                "pin_mode": (["conditioning_rows", "latent_mask"], {
-                    "default": "conditioning_rows",
-                    "tooltip": "conditioning_rows: never-denoised keyframe "
-                               "rows, the mechanism the H3 chaining packs use "
-                               "in production. The pinned spans are also "
-                               "regenerated in the output and cut at splice.\n"
-                               "latent_mask: the content is written into the "
-                               "bridge latent under a zero noise mask; H3 "
-                               "runs those rows at the cond timestep and "
-                               "injects them clean each step, so they come "
-                               "back bit-identical and the sequence is "
-                               "shorter. Leaner, less field mileage."}),
+                "pin_mode": (["latent_mask", "conditioning_rows"], {
+                    "default": "latent_mask",
+                    "tooltip": "latent_mask (recommended for loops): A's "
+                               "content is written into the bridge latent "
+                               "under a zero noise mask; H3 runs those rows "
+                               "at the cond timestep and injects them clean "
+                               "each step, so the pinned spans come back "
+                               "latent-identical and the splice can cut "
+                               "inside them for an exact wrap.\n"
+                               "conditioning_rows: never-denoised keyframe "
+                               "rows, the H3 chaining packs' mechanism. "
+                               "Continuation from the head pin is seamless, "
+                               "but ARRIVAL at the tail rows is soft - the "
+                               "middle lands near A's opening, not on it "
+                               "(the same softness as native fl2va last-"
+                               "frame anchors), so the wrap can read as a "
+                               "jump cut between similar shots."}),
             },
         }
 
@@ -307,8 +322,16 @@ class EsseH3LoopBridge:
 
     def build(self, conditioning, latent, source_latent, head_frames,
               tail_frames, audio_head_frames=24, audio_tail_frames=24,
-              pin_mode="conditioning_rows"):
-        _ensure_h3_ready()
+              pin_mode="latent_mask"):
+        caps = _h3_capabilities()
+        if pin_mode == "conditioning_rows" and not caps["arbitrary_anchors"]:
+            raise ValueError(
+                "esse_h3_loop: this ComfyUI still has the first-generation "
+                "H3 layout, which rejects keyframe anchors other than the "
+                "first and last frame, so pin_mode=conditioning_rows cannot "
+                "place a loop bridge on it. Either set pin_mode to "
+                "'latent_mask' (works on this build), or update ComfyUI to "
+                "get the lifted layout that the H3 chaining packs use.")
         head = int(head_frames)
         tail = int(tail_frames)
 
@@ -605,6 +628,22 @@ class EsseH3LoopSplice:
                                "clicks; 0 for a hard cut."}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 1.0, "max": 240.0,
                                   "step": 0.001}),
+                # appended last: ComfyUI stores widget values positionally,
+                # so inserting this next to the other knobs would shift fps
+                # in every workflow saved against the older node
+                "seam_inset_frames": ("INT", {
+                    "default": 5, "min": 0, "max": 16,
+                    "tooltip": "Cut both joins this many frames INSIDE the "
+                               "pinned spans instead of exactly at their "
+                               "edges. In latent_mask mode the frames on "
+                               "either side of each cut then decode from "
+                               "identical latent content, so the wrap seam "
+                               "is exact by construction; any residual "
+                               "softness stays at the mask edge, where the "
+                               "sampler already smoothed it during "
+                               "generation. The loop starts at clip A frame "
+                               "N instead of 0 (irrelevant for a loop). 0 "
+                               "restores edge cuts."}),
             },
         }
 
@@ -618,7 +657,7 @@ class EsseH3LoopSplice:
 
     def splice(self, images_a, images_bridge, loop_info, audio_a=None,
                audio_bridge=None, video_blend_frames=0, audio_crossfade_ms=10,
-               fps=24.0):
+               fps=24.0, seam_inset_frames=5):
         if loop_info.get("kind") != "bridge":
             raise ValueError("esse_h3_loop: loop_info is not from "
                              "EsseH3LoopBridge")
@@ -626,6 +665,7 @@ class EsseH3LoopSplice:
         tail = int(loop_info["tail_span"])
         F_b = int(loop_info["bridge_frames"])
         F_a = int(loop_info["source_frames"])
+        mode = loop_info.get("pin_mode", "conditioning_rows")
 
         if int(images_bridge.shape[0]) != F_b:
             raise ValueError(
@@ -638,20 +678,36 @@ class EsseH3LoopSplice:
                          int(images_a.shape[0]), F_a)
             F_a = int(images_a.shape[0])
 
-        a = images_a
-        mid = images_bridge[head:F_b - tail]
+        # Cut both joins `inset` frames INSIDE the pinned spans rather than
+        # at their edges. The kept bridge segment then begins and ends with
+        # pinned copies of A, so each cut sits between a real A frame and
+        # its pinned counterpart - identical latent content in latent_mask
+        # mode, so the wrap is exact by construction. The mask-edge
+        # transition (free middle meeting pinned content) stays inside the
+        # segment, where the sampler smoothed it during generation. Head
+        # pins continue motion and bind hard; tail rows are arrived at
+        # softly (native fl2va's known last-frame behaviour), which is why
+        # an edge cut at the wrap can land near A's opening instead of on
+        # it - the inset is what removes that residual.
+        inset = max(0, int(seam_inset_frames))
+        inset = min(inset, head - 1, tail - 1, (F_a - 1) // 2)
+        a_lo, a_hi = inset, F_a - inset
+        b_lo, b_hi = head - inset, F_b - tail + inset
+
+        a = images_a[a_lo:a_hi]
+        mid = images_bridge[b_lo:b_hi]
 
         blend = int(video_blend_frames)
-        blend = min(blend, head, tail, F_a // 2, mid.shape[0] // 2)
+        blend = min(blend, b_lo, tail - inset, a.shape[0] // 2, mid.shape[0] // 2)
         if blend > 0:
             a = a.clone()
-            # join 1: A's ending eases into the bridge's regeneration of it
-            a[F_a - blend:] = _crossfade(
-                a[F_a - blend:], images_bridge[head - blend:head].to(a.device),
+            # join 1: A's ending eases into the bridge's copy of it
+            a[-blend:] = _crossfade(
+                a[-blend:], images_bridge[b_lo - blend:b_lo].to(a.device),
                 rising=True)
-            # the wrap: the bridge's regeneration of A's opening eases into A
+            # the wrap: the bridge's copy of A's opening eases into A
             a[:blend] = _crossfade(
-                images_bridge[F_b - tail:F_b - tail + blend].to(a.device),
+                images_bridge[b_hi:b_hi + blend].to(a.device),
                 a[:blend], rising=True)
         loop = torch.cat([a, mid.to(a.device)], dim=0)
 
@@ -661,26 +717,32 @@ class EsseH3LoopSplice:
             if int(audio_bridge["sample_rate"]) != sr:
                 raise ValueError("esse_h3_loop: audio sample rates differ "
                                  "(%d vs %d)" % (sr, int(audio_bridge["sample_rate"])))
-            wav_a = _match_audio_len(audio_a["waveform"], sr, F_a / fps, "clip A")
+            wav_a = _match_audio_len(
+                _slice_audio_seconds(audio_a["waveform"], sr, a_lo / fps,
+                                     F_a / fps),
+                sr, a.shape[0] / fps, "clip A")
             wav_b = audio_bridge["waveform"]
             mid_wav = _match_audio_len(
-                _slice_audio_seconds(wav_b, sr, head / fps, (F_b - tail) / fps),
+                _slice_audio_seconds(wav_b, sr, b_lo / fps, b_hi / fps),
                 sr, mid.shape[0] / fps, "bridge middle")
 
             j = int(round(audio_crossfade_ms / 1000.0 * sr))
-            j = min(j, wav_a.shape[-1] // 2, mid_wav.shape[-1] // 2)
+            j = min(j, wav_a.shape[-1] // 2, mid_wav.shape[-1] // 2,
+                    int(round(b_lo / fps * sr)),
+                    int(round((F_b - b_hi) / fps * sr)))
             if j > 0:
                 wav_a = wav_a.clone()
                 # join 1: fade A's last j samples into the discarded sound
-                # just before the middle starts
-                pre = _slice_audio_seconds(wav_b, sr, head / fps - j / sr, head / fps)
+                # just before the kept bridge segment starts
+                pre = _slice_audio_seconds(wav_b, sr, b_lo / fps - j / sr,
+                                           b_lo / fps)
                 if pre.shape[-1] == j:
                     wav_a[..., -j:] = _crossfade_wave(
                         wav_a[..., -j:], pre.to(wav_a.device), rising=True)
-                # the wrap: the discarded sound just after the middle ends
-                # (the bridge playing A's opening) fades into A's real opening
-                post = _slice_audio_seconds(wav_b, sr, (F_b - tail) / fps,
-                                            (F_b - tail) / fps + j / sr)
+                # the wrap: the discarded sound just after the kept segment
+                # ends fades into the loop's opening
+                post = _slice_audio_seconds(wav_b, sr, b_hi / fps,
+                                            b_hi / fps + j / sr)
                 if post.shape[-1] == j:
                     wav_a[..., :j] = _crossfade_wave(
                         post.to(wav_a.device), wav_a[..., :j], rising=True)
@@ -690,9 +752,25 @@ class EsseH3LoopSplice:
             _LOG.warning("esse_h3_loop: only one of audio_a/audio_bridge is "
                          "wired; the loop is silent. Wire both or neither.")
 
-        report = ("loop: %d frames (%.2fs at %.3g fps) = clip A %d + bridge "
-                  "middle %d; wrap lands on A frame 0"
-                  % (loop.shape[0], loop.shape[0] / fps, fps, F_a, mid.shape[0]))
+        # Seam quality, measured: frame deltas at the two cuts against the
+        # loop's own typical frame-to-frame delta. A seam near 1.0x baseline
+        # is invisible; several times baseline reads as a jump cut.
+        def _delta(x, y):
+            return float((x.float() - y.float()).abs().mean())
+
+        pairs = [_delta(loop[i], loop[i + 1]) for i in range(0, loop.shape[0] - 1, 8)]
+        base = max(sum(pairs) / max(len(pairs), 1), 1e-6)
+        join1 = _delta(loop[a.shape[0] - 1], loop[a.shape[0]])
+        wrap = _delta(loop[-1], loop[0])
+
+        report = ("loop: %d frames (%.2fs at %.3g fps) = clip A[%d:%d] + "
+                  "bridge[%d:%d] (%s, seam inset %d)\n"
+                  "seam deltas vs baseline %.4f: join %.4f (%.1fx), wrap "
+                  "%.4f (%.1fx) - near 1x is seamless"
+                  % (loop.shape[0], loop.shape[0] / fps, fps, a_lo, a_hi,
+                     b_lo, b_hi, mode, inset,
+                     base, join1, join1 / base, wrap, wrap / base))
+        _LOG.info("esse_h3_loop: %s", report.replace("\n", " | "))
         return (loop, out_audio, report)
 
 
