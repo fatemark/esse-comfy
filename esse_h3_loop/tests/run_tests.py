@@ -296,7 +296,8 @@ def test_splice():
                                       audio_a=audio_dict(124, tag=0.0),
                                       audio_bridge=audio_dict(124, tag=50000.0),
                                       video_blend_frames=0,
-                                      audio_crossfade_ms=0)
+                                      audio_crossfade_ms=0,
+                                      seam_inset_frames=0)
     check("loop length 204", loop.shape[0] == 204, loop.shape[0])
     check("A kept verbatim", float(loop[0, 0, 0, 0]) == 0.0
           and float(loop[123, 0, 0, 0]) == 123.0)
@@ -318,11 +319,34 @@ def test_splice():
                                    audio_a=audio_dict(124, tag=0.0),
                                    audio_bridge=audio_dict(124, tag=50000.0),
                                    video_blend_frames=6,
-                                   audio_crossfade_ms=20)
+                                   audio_crossfade_ms=20,
+                                   seam_inset_frames=0)
     check("blended loop same length", loop2.shape[0] == 204
           and audio2["waveform"].shape[-1] == audio["waveform"].shape[-1])
     check("wrap blend mixes bridge material into A's opening",
           float(loop2[0, 0, 0, 0]) != 0.0 and float(loop2[10, 0, 0, 0]) == 10.0)
+
+    # seam inset (default 5): cuts move inside the pinned spans, so each
+    # join sits between a real A frame and its pinned counterpart
+    loop3, audio3, report3 = node.splice(
+        a, b, info, audio_a=audio_dict(124, tag=0.0),
+        audio_bridge=audio_dict(124, tag=50000.0),
+        video_blend_frames=0, audio_crossfade_ms=0)
+    check("inset loop still 204 frames", loop3.shape[0] == 204,
+          loop3.shape[0])
+    check("inset loop starts at A frame 5", float(loop3[0, 0, 0, 0]) == 5.0)
+    check("A part ends at true frame 118 then bridge copy of 119",
+          float(loop3[113, 0, 0, 0]) == 118.0
+          and float(loop3[114, 0, 0, 0]) == 1017.0)
+    check("inset loop ends on bridge copy of A frame 4",
+          float(loop3[203, 0, 0, 0]) == 1106.0)
+    sr3 = audio3["sample_rate"]
+    check("inset audio starts at the 5/24s sample of A",
+          close(float(audio3["waveform"][0, 0, 0]), round(5 / 24 * sr3)))
+    check("inset audio length exact",
+          audio3["waveform"].shape[-1] == int(round(204 / 24 * sr3)))
+    check("report carries seam metrics",
+          "seam deltas" in report3 and "inset 5" in report3)
 
     # frame-count mismatch on the bridge is refused
     try:
@@ -451,6 +475,54 @@ def test_trim_and_preview():
           close(float(raudio["waveform"][0, 0, 0]), round(50 / 24 * 32000)))
 
 
+def test_old_layout_gating():
+    """First-generation H3 layout (PackedLayout with frame_count, e.g.
+    ComfyUI v0.30.x): conditioning_rows must refuse with advice, while
+    latent_mask and the Mobius patch keep working."""
+    print("old-layout gating")
+    mm = sys.modules["comfy.ldm.minimax.model"]
+    new_layout = mm.PackedLayout
+
+    class OldPackedLayout:
+        def __init__(self, text_len, latent_t, latent_h, latent_w, audio_t,
+                     keyframes=None, refs=None, frame_count=None):
+            pass
+
+    mm.PackedLayout = OldPackedLayout
+    nodes._h3_state = None
+    try:
+        caps = nodes._h3_capabilities()
+        check("old layout detected", caps["arbitrary_anchors"] is False)
+
+        src = av_latent(124, tag=0.0)
+        bridge = av_latent(124, tag=500.0)
+        cond = [[torch.zeros(1, 3, 8), {}]]
+        node = nodes.EsseH3LoopBridge()
+        try:
+            node.build(cond, bridge, src, "22", "22", 24, 24,
+                       "conditioning_rows")
+            check("conditioning_rows refused on old layout", False)
+        except ValueError as exc:
+            check("conditioning_rows refused on old layout",
+                  "latent_mask" in str(exc))
+
+        _, out_latent, _, _ = node.build(cond, bridge, src, "22", "22",
+                                         24, 24, "latent_mask")
+        check("latent_mask still works on old layout",
+              "noise_mask" in out_latent)
+
+        try:
+            nodes.EsseH3MobiusLoopTrim()  # trivially constructible
+            nodes._MobiusRotationWrapper(20, False)
+            nodes._ensure_h3_ready()
+            check("mobius path not blocked by old layout", True)
+        except Exception as exc:
+            check("mobius path not blocked by old layout", False, exc)
+    finally:
+        mm.PackedLayout = new_layout
+        nodes._h3_state = None
+
+
 if __name__ == "__main__":
     test_grid()
     test_bridge_cond_rows()
@@ -458,6 +530,7 @@ if __name__ == "__main__":
     test_splice()
     test_mobius()
     test_trim_and_preview()
+    test_old_layout_gating()
     print()
     if FAILS:
         print("%d FAILURES: %s" % (len(FAILS), FAILS))

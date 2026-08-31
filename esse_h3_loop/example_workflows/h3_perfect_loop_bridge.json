@@ -718,7 +718,7 @@
     "22",
     24,
     24,
-    "conditioning_rows"
+    "latent_mask"
    ]
   },
   {
@@ -1074,7 +1074,8 @@
    "widgets_values": [
     0,
     10,
-    24.0
+    24.0,
+    5
    ]
   },
   {
